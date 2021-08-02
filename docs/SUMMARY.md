@@ -15,7 +15,8 @@
 
 ## Tutorials
 
-* [Driver ranking](tutorials/driver-ranking-with-feast.md)
+* [Driver Ranking](tutorials/driver-ranking-with-feast.md)
+* [Fraud Detection](tutorials/fraud-detection.md)
 
 ## Concepts
 
@@ -26,6 +27,7 @@
 * [Offline store](concepts/offline-store.md)
 * [Provider](concepts/provider.md)
 * [Architecture](concepts/architecture-and-components.md)
+* [Feature service](concepts/feature-service.md)
 
 ## How-to Guides
 

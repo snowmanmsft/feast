@@ -2,7 +2,7 @@ import contextlib
 import os
 import tempfile
 import uuid
-from typing import Generator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -178,7 +178,12 @@ def upload_df_to_redshift(
     # Drop the index so that we dont have unnecessary columns
     df.reset_index(drop=True, inplace=True)
 
-    # Convert Pandas DataFrame into PyArrow table and compile the Redshift table schema
+    # Convert Pandas DataFrame into PyArrow table and compile the Redshift table schema.
+    # Note, if the underlying data has missing values,
+    # pandas will convert those values to np.nan if the dtypes are numerical (floats, ints, etc.) or boolean.
+    # If the dtype is 'object', then missing values are inferred as python `None`s.
+    # More details at:
+    # https://pandas.pydata.org/pandas-docs/stable/user_guide/missing_data.html#values-considered-missing
     table = pa.Table.from_pandas(df)
     column_names, column_types = [], []
     for field in table.schema:
@@ -222,7 +227,7 @@ def temporarily_upload_df_to_redshift(
     iam_role: str,
     table_name: str,
     df: pd.DataFrame,
-) -> Generator[None, None, None]:
+) -> Iterator[None]:
     """Uploads a Pandas DataFrame to Redshift as a new table with cleanup logic.
 
     This is essentially the same as upload_df_to_redshift (check out its docstring for full details),

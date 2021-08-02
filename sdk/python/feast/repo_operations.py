@@ -13,7 +13,7 @@ from click.exceptions import BadParameter
 
 from feast import Entity, FeatureTable
 from feast.feature_service import FeatureService
-from feast.feature_store import FeatureStore
+from feast.feature_store import FeatureStore, _validate_feature_views
 from feast.feature_view import FeatureView
 from feast.inference import (
     update_data_sources_with_inferred_event_timestamp_col,
@@ -103,7 +103,6 @@ def parse_repo(repo_root: Path) -> ParsedRepo:
     for repo_file in get_repo_files(repo_root):
         module_path = py_path_to_module(repo_file, repo_root)
         module = importlib.import_module(module_path)
-
         for attr_name in dir(module):
             obj = getattr(module, attr_name)
             if isinstance(obj, FeatureTable):
@@ -117,18 +116,24 @@ def parse_repo(repo_root: Path) -> ParsedRepo:
     return res
 
 
-def apply_feature_services(registry: Registry, project: str, repo: ParsedRepo):
+def apply_feature_services(
+    registry: Registry,
+    project: str,
+    repo: ParsedRepo,
+    existing_feature_services: List[FeatureService],
+):
     from colorama import Fore, Style
 
     # Determine which feature services should be deleted.
-    existing_feature_services = registry.list_feature_services(project)
     for feature_service in repo.feature_services:
         if feature_service in existing_feature_services:
             existing_feature_services.remove(feature_service)
 
     # The remaining features services in the list should be deleted.
     for feature_service_to_delete in existing_feature_services:
-        registry.delete_feature_service(feature_service_to_delete.name, project)
+        registry.delete_feature_service(
+            feature_service_to_delete.name, project, commit=False
+        )
         click.echo(
             f"Deleted feature service {Style.BRIGHT + Fore.GREEN}{feature_service_to_delete.name}{Style.RESET_ALL} "
             f"from registry"
@@ -162,7 +167,8 @@ def apply_total(repo_config: RepoConfig, repo_path: Path, skip_source_validation
     registry._initialize_registry()
     sys.dont_write_bytecode = True
     repo = parse_repo(repo_path)
-    data_sources = [t.input for t in repo.feature_views]
+    _validate_feature_views(repo.feature_views)
+    data_sources = [t.batch_source for t in repo.feature_views]
 
     if not skip_source_validation:
         # Make sure the data source used by this feature view is supported by Feast
@@ -175,7 +181,7 @@ def apply_total(repo_config: RepoConfig, repo_path: Path, skip_source_validation
     )
     update_data_sources_with_inferred_event_timestamp_col(data_sources, repo_config)
     for view in repo.feature_views:
-        view.infer_features_from_input_source(repo_config)
+        view.infer_features_from_batch_source(repo_config)
 
     repo_table_names = set(t.name for t in repo.feature_tables)
 
@@ -191,6 +197,16 @@ def apply_total(repo_config: RepoConfig, repo_path: Path, skip_source_validation
     for registry_view in registry.list_feature_views(project=project):
         if registry_view.name not in repo_table_names:
             views_to_delete.append(registry_view)
+
+    entities_to_delete: List[Entity] = []
+    repo_entities_names = set([e.name for e in repo.entities])
+    for registry_entity in registry.list_entities(project=project):
+        if registry_entity.name not in repo_entities_names:
+            entities_to_delete.append(registry_entity)
+
+    entities_to_keep: List[Entity] = repo.entities
+
+    existing_feature_services = registry.list_feature_services(project)
 
     sys.dont_write_bytecode = False
     for entity in repo.entities:
@@ -228,9 +244,8 @@ def apply_total(repo_config: RepoConfig, repo_path: Path, skip_source_validation
         click.echo(
             f"Registered feature view {Style.BRIGHT + Fore.GREEN}{view.name}{Style.RESET_ALL}"
         )
-    registry.commit()
 
-    apply_feature_services(registry, project, repo)
+    apply_feature_services(registry, project, repo, existing_feature_services)
 
     infra_provider = get_provider(repo_config, repo_path)
 
@@ -241,14 +256,6 @@ def apply_total(repo_config: RepoConfig, repo_path: Path, skip_source_validation
     all_to_keep: List[Union[FeatureTable, FeatureView]] = []
     all_to_keep.extend(repo.feature_tables)
     all_to_keep.extend(repo.feature_views)
-
-    entities_to_delete: List[Entity] = []
-    repo_entities_names = set([e.name for e in repo.entities])
-    for registry_entity in registry.list_entities(project=project):
-        if registry_entity.name not in repo_entities_names:
-            entities_to_delete.append(registry_entity)
-
-    entities_to_keep: List[Entity] = repo.entities
 
     for name in [view.name for view in repo.feature_tables] + [
         table.name for table in repo.feature_views
@@ -271,6 +278,9 @@ def apply_total(repo_config: RepoConfig, repo_path: Path, skip_source_validation
         entities_to_keep=entities_to_keep,
         partial=False,
     )
+
+    # Commit the update to the registry only after successful infra update
+    registry.commit()
 
 
 @log_exceptions_and_usage
