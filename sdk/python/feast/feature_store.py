@@ -99,6 +99,11 @@ class FeatureStore:
         return get_version()
 
     @property
+    def registry(self) -> Registry:
+        """Gets the registry of this feature store."""
+        return self._registry
+
+    @property
     def project(self) -> str:
         """Gets the project of this feature store."""
         return self.config.project
@@ -224,6 +229,19 @@ class FeatureStore:
         """
         return self._registry.delete_feature_view(name, self.project)
 
+    @log_exceptions_and_usage
+    def delete_feature_service(self, name: str):
+        """
+            Deletes a feature service.
+
+            Args:
+                name: Name of feature service.
+
+            Raises:
+                FeatureServiceNotFoundException: The feature view could not be found.
+            """
+        return self._registry.delete_feature_service(name, self.project)
+
     def _get_features(
         self,
         features: Optional[Union[List[str], FeatureService]],
@@ -252,6 +270,7 @@ class FeatureStore:
             FeatureService,
             List[Union[FeatureView, Entity, FeatureService]],
         ],
+        commit: bool = True,
     ):
         """Register objects to metadata store and update related infrastructure.
 
@@ -262,27 +281,30 @@ class FeatureStore:
 
         Args:
             objects: A single object, or a list of objects that should be registered with the Feature Store.
+            commit: whether to commit changes to the registry
 
         Raises:
             ValueError: The 'objects' parameter could not be parsed properly.
 
         Examples:
-            Register a single Entity and FeatureView.
+            Register an Entity and a FeatureView.
 
-            >>> from feast.feature_store import FeatureStore
-            >>> from feast import Entity, FeatureView, Feature, ValueType, FileSource
+            >>> from feast import FeatureStore, Entity, FeatureView, Feature, ValueType, FileSource, RepoConfig
             >>> from datetime import timedelta
-            >>>
-            >>> fs = FeatureStore()
-            >>> customer_entity = Entity(name="customer", value_type=ValueType.INT64, description="customer entity")
-            >>> customer_feature_view = FeatureView(
-            >>>     name="customer_fv",
-            >>>     entities=["customer"],
-            >>>     features=[Feature(name="age", dtype=ValueType.INT64)],
-            >>>     batch_source=FileSource(path="file.parquet", event_timestamp_column="timestamp"),
-            >>>     ttl=timedelta(days=1)
-            >>> )
-            >>> fs.apply([customer_entity, customer_feature_view])
+            >>> fs = FeatureStore(config=RepoConfig(registry="feature_repo/data/registry.db", project="feature_repo", provider="local"))
+            >>> driver = Entity(name="driver_id", value_type=ValueType.INT64, description="driver id")
+            >>> driver_hourly_stats = FileSource(
+            ...     path="feature_repo/data/driver_stats.parquet",
+            ...     event_timestamp_column="event_timestamp",
+            ...     created_timestamp_column="created",
+            ... )
+            >>> driver_hourly_stats_view = FeatureView(
+            ...     name="driver_hourly_stats",
+            ...     entities=["driver_id"],
+            ...     ttl=timedelta(seconds=86400 * 1),
+            ...     batch_source=driver_hourly_stats,
+            ... )
+            >>> fs.apply([driver_hourly_stats_view, driver]) # register entity and feature view
         """
         # TODO: Add locking
 
@@ -319,7 +341,6 @@ class FeatureStore:
             self._registry.apply_entity(ent, project=self.project, commit=False)
         for feature_service in services_to_update:
             self._registry.apply_feature_service(feature_service, project=self.project)
-        self._registry.commit()
 
         self._get_provider().update_infra(
             project=self.project,
@@ -329,6 +350,9 @@ class FeatureStore:
             entities_to_keep=entities_to_update,
             partial=True,
         )
+
+        if commit:
+            self._registry.commit()
 
     @log_exceptions_and_usage
     def teardown(self):
@@ -385,17 +409,49 @@ class FeatureStore:
             ValueError: Both or neither of features and feature_refs are specified.
 
         Examples:
-            Retrieve historical features using a BigQuery SQL entity dataframe
+            Retrieve historical features from a local offline store.
 
-            >>> from feast.feature_store import FeatureStore
-            >>>
-            >>> fs = FeatureStore(config=RepoConfig(provider="gcp"))
+            >>> from feast import FeatureStore, Entity, FeatureView, Feature, ValueType, FileSource, RepoConfig
+            >>> from datetime import timedelta
+            >>> import pandas as pd
+            >>> fs = FeatureStore(config=RepoConfig(registry="feature_repo/data/registry.db", project="feature_repo", provider="local"))
+            >>> # Before retrieving historical features, we must register the appropriate entity and featureview.
+            >>> driver = Entity(name="driver_id", value_type=ValueType.INT64, description="driver id")
+            >>> driver_hourly_stats = FileSource(
+            ...     path="feature_repo/data/driver_stats.parquet",
+            ...     event_timestamp_column="event_timestamp",
+            ...     created_timestamp_column="created",
+            ... )
+            >>> driver_hourly_stats_view = FeatureView(
+            ...     name="driver_hourly_stats",
+            ...     entities=["driver_id"],
+            ...     ttl=timedelta(seconds=86400 * 1),
+            ...     features=[
+            ...         Feature(name="conv_rate", dtype=ValueType.FLOAT),
+            ...         Feature(name="acc_rate", dtype=ValueType.FLOAT),
+            ...         Feature(name="avg_daily_trips", dtype=ValueType.INT64),
+            ...     ],
+            ...     batch_source=driver_hourly_stats,
+            ... )
+            >>> fs.apply([driver_hourly_stats_view, driver]) # register entity and feature view
+            >>> entity_df = pd.DataFrame.from_dict(
+            ...     {
+            ...         "driver_id": [1001, 1002],
+            ...         "event_timestamp": [
+            ...             datetime(2021, 4, 12, 10, 59, 42),
+            ...             datetime(2021, 4, 12, 8, 12, 10),
+            ...         ],
+            ...     }
+            ... )
             >>> retrieval_job = fs.get_historical_features(
-            >>>     entity_df="SELECT event_timestamp, order_id, customer_id from gcp_project.my_ds.customer_orders",
-            >>>     features=["customer:age", "customer:avg_orders_1d", "customer:avg_orders_7d"]
-            >>> )
+            ...     entity_df=entity_df,
+            ...     features=[
+            ...         "driver_hourly_stats:conv_rate",
+            ...         "driver_hourly_stats:acc_rate",
+            ...         "driver_hourly_stats:avg_daily_trips",
+            ...     ],
+            ... )
             >>> feature_data = retrieval_job.to_df()
-            >>> model.fit(feature_data) # insert your modeling framework here.
         """
         if (features is not None and feature_refs is not None) or (
             features is None and feature_refs is None
@@ -460,11 +516,32 @@ class FeatureStore:
         Examples:
             Materialize all features into the online store up to 5 minutes ago.
 
-            >>> from datetime import datetime, timedelta
-            >>> from feast.feature_store import FeatureStore
-            >>>
-            >>> fs = FeatureStore(config=RepoConfig(provider="gcp", registry="gs://my-fs/", project="my_fs_proj"))
+            >>> from feast import FeatureStore, Entity, FeatureView, Feature, ValueType, FileSource, RepoConfig
+            >>> from datetime import timedelta
+            >>> fs = FeatureStore(config=RepoConfig(registry="feature_repo/data/registry.db", project="feature_repo", provider="local"))
+            >>> # Before materializing, we must register the appropriate entity and featureview.
+            >>> driver = Entity(name="driver_id", value_type=ValueType.INT64, description="driver id",)
+            >>> driver_hourly_stats = FileSource(
+            ...     path="feature_repo/data/driver_stats.parquet",
+            ...     event_timestamp_column="event_timestamp",
+            ...     created_timestamp_column="created",
+            ... )
+            >>> driver_hourly_stats_view = FeatureView(
+            ...     name="driver_hourly_stats",
+            ...     entities=["driver_id"],
+            ...     ttl=timedelta(seconds=86400 * 1),
+            ...     features=[
+            ...         Feature(name="conv_rate", dtype=ValueType.FLOAT),
+            ...         Feature(name="acc_rate", dtype=ValueType.FLOAT),
+            ...         Feature(name="avg_daily_trips", dtype=ValueType.INT64),
+            ...     ],
+            ...     batch_source=driver_hourly_stats,
+            ... )
+            >>> fs.apply([driver_hourly_stats_view, driver]) # register entity and feature view
             >>> fs.materialize_incremental(end_date=datetime.utcnow() - timedelta(minutes=5))
+            Materializing...
+            <BLANKLINE>
+            ...
         """
         feature_views_to_materialize = []
         if feature_views is None:
@@ -543,13 +620,34 @@ class FeatureStore:
             Materialize all features into the online store over the interval
             from 3 hours ago to 10 minutes ago.
 
-            >>> from datetime import datetime, timedelta
-            >>> from feast.feature_store import FeatureStore
-            >>>
-            >>> fs = FeatureStore(config=RepoConfig(provider="gcp"))
+            >>> from feast import FeatureStore, Entity, FeatureView, Feature, ValueType, FileSource, RepoConfig
+            >>> from datetime import timedelta
+            >>> fs = FeatureStore(config=RepoConfig(registry="feature_repo/data/registry.db", project="feature_repo", provider="local"))
+            >>> # Before materializing, we must register the appropriate entity and featureview.
+            >>> driver = Entity(name="driver_id", value_type=ValueType.INT64, description="driver id",)
+            >>> driver_hourly_stats = FileSource(
+            ...     path="feature_repo/data/driver_stats.parquet",
+            ...     event_timestamp_column="event_timestamp",
+            ...     created_timestamp_column="created",
+            ... )
+            >>> driver_hourly_stats_view = FeatureView(
+            ...     name="driver_hourly_stats",
+            ...     entities=["driver_id"],
+            ...     ttl=timedelta(seconds=86400 * 1),
+            ...     features=[
+            ...         Feature(name="conv_rate", dtype=ValueType.FLOAT),
+            ...         Feature(name="acc_rate", dtype=ValueType.FLOAT),
+            ...         Feature(name="avg_daily_trips", dtype=ValueType.INT64),
+            ...     ],
+            ...     batch_source=driver_hourly_stats,
+            ... )
+            >>> fs.apply([driver_hourly_stats_view, driver]) # register entity and feature view
             >>> fs.materialize(
-            >>>   start_date=datetime.utcnow() - timedelta(hours=3), end_date=datetime.utcnow() - timedelta(minutes=10)
-            >>> )
+            ...     start_date=datetime.utcnow() - timedelta(hours=3), end_date=datetime.utcnow() - timedelta(minutes=10)
+            ... )
+            Materializing...
+            <BLANKLINE>
+            ...
         """
         if utils.make_tzaware(start_date) > utils.make_tzaware(end_date):
             raise ValueError(
@@ -631,17 +729,47 @@ class FeatureStore:
             Exception: No entity with the specified name exists.
 
         Examples:
-            >>> from feast import FeatureStore
-            >>>
-            >>> store = FeatureStore(repo_path="...")
-            >>> feature_refs = ["sales:daily_transactions"]
-            >>> entity_rows = [{"customer_id": 0},{"customer_id": 1}]
-            >>>
-            >>> online_response = store.get_online_features(
-            >>>     feature_refs, entity_rows)
+            Materialize all features into the online store over the interval
+            from 3 hours ago to 10 minutes ago, and then retrieve these online features.
+
+            >>> from feast import FeatureStore, Entity, FeatureView, Feature, ValueType, FileSource, RepoConfig
+            >>> from datetime import timedelta
+            >>> import pandas as pd
+            >>> fs = FeatureStore(config=RepoConfig(registry="feature_repo/data/registry.db", project="feature_repo", provider="local"))
+            >>> # Before getting online features, we must register the appropriate entity and featureview and then materialize the features.
+            >>> driver = Entity(name="driver_id", value_type=ValueType.INT64, description="driver id",)
+            >>> driver_hourly_stats = FileSource(
+            ...     path="feature_repo/data/driver_stats.parquet",
+            ...     event_timestamp_column="event_timestamp",
+            ...     created_timestamp_column="created",
+            ... )
+            >>> driver_hourly_stats_view = FeatureView(
+            ...     name="driver_hourly_stats",
+            ...     entities=["driver_id"],
+            ...     ttl=timedelta(seconds=86400 * 1),
+            ...     features=[
+            ...         Feature(name="conv_rate", dtype=ValueType.FLOAT),
+            ...         Feature(name="acc_rate", dtype=ValueType.FLOAT),
+            ...         Feature(name="avg_daily_trips", dtype=ValueType.INT64),
+            ...     ],
+            ...     batch_source=driver_hourly_stats,
+            ... )
+            >>> fs.apply([driver_hourly_stats_view, driver]) # register entity and feature view
+            >>> fs.materialize(
+            ...     start_date=datetime.utcnow() - timedelta(hours=3), end_date=datetime.utcnow() - timedelta(minutes=10)
+            ... )
+            Materializing...
+            <BLANKLINE>
+            ...
+            >>> online_response = fs.get_online_features(
+            ...     features=[
+            ...         "driver_hourly_stats:conv_rate",
+            ...         "driver_hourly_stats:acc_rate",
+            ...         "driver_hourly_stats:avg_daily_trips",
+            ...     ],
+            ...     entity_rows=[{"driver_id": 1001}, {"driver_id": 1002}, {"driver_id": 1003}, {"driver_id": 1004}],
+            ... )
             >>> online_response_dict = online_response.to_dict()
-            >>> print(online_response_dict)
-            {'sales:daily_transactions': [1.1,1.2], 'sales:customer_id': [0,1]}
         """
         _feature_refs = self._get_features(features, feature_refs)
 
