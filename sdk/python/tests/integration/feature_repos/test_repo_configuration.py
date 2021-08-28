@@ -36,17 +36,37 @@ class TestRepoConfig:
     infer_event_timestamp_col: bool = True
 
 
+def ds_creator_path(cls: str):
+    return f"tests.integration.feature_repos.universal.data_sources.{cls}"
+
+
+DYNAMO_CONFIG = {"type": "dynamodb", "region": "us-west-2"}
+REDIS_CONFIG = {"type": "redis", "connection_string": "localhost:6379,db=0"}
 FULL_REPO_CONFIGS: List[TestRepoConfig] = [
-    TestRepoConfig(),  # Local
+    # Local configurations
+    TestRepoConfig(),
+    TestRepoConfig(online_store=REDIS_CONFIG),
+    # GCP configurations
     TestRepoConfig(
         provider="gcp",
-        offline_store_creator="tests.integration.feature_repos.universal.data_sources.bigquery.BigQueryDataSourceCreator",
+        offline_store_creator=ds_creator_path("bigquery.BigQueryDataSourceCreator"),
         online_store="datastore",
     ),
     TestRepoConfig(
+        provider="gcp",
+        offline_store_creator=ds_creator_path("bigquery.BigQueryDataSourceCreator"),
+        online_store=REDIS_CONFIG,
+    ),
+    # AWS configurations
+    TestRepoConfig(
         provider="aws",
-        offline_store_creator="tests.integration.feature_repos.universal.data_sources.redshift.RedshiftDataSourceCreator",
-        online_store={"type": "dynamodb", "region": "us-west-2"},
+        offline_store_creator=ds_creator_path("redshift.RedshiftDataSourceCreator"),
+        online_store=DYNAMO_CONFIG,
+    ),
+    TestRepoConfig(
+        provider="aws",
+        offline_store_creator=ds_creator_path("redshift.RedshiftDataSourceCreator"),
+        online_store=REDIS_CONFIG,
     ),
 ]
 
@@ -95,7 +115,7 @@ class Environment:
             customer_table_id = self.data_source_creator.get_prefixed_table_name(
                 self.name, "customer_profile"
             )
-            ds = self.data_source_creator.create_data_sources(
+            ds = self.data_source_creator.create_data_source(
                 customer_table_id,
                 self.customer_df,
                 event_timestamp_column="event_timestamp",
@@ -109,7 +129,7 @@ class Environment:
             driver_table_id = self.data_source_creator.get_prefixed_table_name(
                 self.name, "driver_hourly"
             )
-            ds = self.data_source_creator.create_data_sources(
+            ds = self.data_source_creator.create_data_source(
                 driver_table_id,
                 self.driver_df,
                 event_timestamp_column="event_timestamp",
@@ -125,7 +145,7 @@ class Environment:
             orders_table_id = self.data_source_creator.get_prefixed_table_name(
                 self.name, "orders"
             )
-            ds = self.data_source_creator.create_data_sources(
+            ds = self.data_source_creator.create_data_source(
                 orders_table_id,
                 self.orders_df,
                 event_timestamp_column="event_timestamp",
@@ -176,7 +196,9 @@ def vary_providers_for_offline_stores(
 
 @contextmanager
 def construct_test_environment(
-    test_repo_config: TestRepoConfig, create_and_apply: bool = False
+    test_repo_config: TestRepoConfig,
+    create_and_apply: bool = False,
+    materialize: bool = False,
 ) -> Environment:
     """
     This method should take in the parameters from the test repo config and created a feature repo, apply it,
@@ -199,7 +221,7 @@ def construct_test_environment(
     offline_creator: DataSourceCreator = importer.get_class_from_type(
         module_name, config_class_name, "DataSourceCreator"
     )(project)
-    ds = offline_creator.create_data_sources(
+    ds = offline_creator.create_data_source(
         project, df, field_mapping={"ts_1": "ts", "id": "driver_id"}
     )
     offline_store = offline_creator.create_offline_store_config()
@@ -236,6 +258,9 @@ def construct_test_environment(
                 )
                 fs.apply(fvs + entities)
 
+            if materialize:
+                fs.materialize(environment.start_date, environment.end_date)
+
             yield environment
         finally:
             offline_creator.teardown()
@@ -266,13 +291,14 @@ def parametrize_e2e_test(e2e_test):
 
 def parametrize_offline_retrieval_test(offline_retrieval_test):
     """
-    This decorator should be used for end-to-end tests. These tests are expected to be parameterized,
-    and receive an empty feature repo created for all supported configurations.
+    This decorator should be used by tests that rely on the offline store. These tests are expected to be parameterized,
+    and receive an Environment object that contains a reference to a Feature Store with pre-applied
+    entities and feature views.
 
     The decorator also ensures that sample data needed for the test is available in the relevant offline store.
 
-    Decorated tests should create and apply the objects needed by the tests, and perform any operations needed
-    (such as materialization and looking up feature values).
+    Decorated tests should interact with the offline store, via the FeatureStore.get_historical_features method. They
+    may perform more operations as needed.
 
     The decorator takes care of tearing down the feature store, as well as the sample data.
     """
@@ -286,5 +312,32 @@ def parametrize_offline_retrieval_test(offline_retrieval_test):
     def inner_test(config):
         with construct_test_environment(config, create_and_apply=True) as environment:
             offline_retrieval_test(environment)
+
+    return inner_test
+
+
+def parametrize_online_test(online_test):
+    """
+    This decorator should be used by tests that rely on the offline store. These tests are expected to be parameterized,
+    and receive an Environment object that contains a reference to a Feature Store with pre-applied
+    entities and feature views.
+
+    The decorator also ensures that sample data needed for the test is available in the relevant offline store. This
+    data is also materialized into the online store.
+
+    The decorator takes care of tearing down the feature store, as well as the sample data.
+    """
+
+    configs = vary_providers_for_offline_stores(FULL_REPO_CONFIGS)
+    configs = vary_full_feature_names(configs)
+    configs = vary_infer_event_timestamp_col(configs)
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize("config", configs, ids=lambda v: str(v))
+    def inner_test(config):
+        with construct_test_environment(
+            config, create_and_apply=True, materialize=True
+        ) as environment:
+            online_test(environment)
 
     return inner_test
